@@ -4,9 +4,19 @@ BRANCH=$(git branch --show-current 2>/dev/null || echo "n/a")
 DATA=$(cat)
 
 DIR=$(echo "$DATA" | jq -r '.workspace.current_dir | split("/") | last')
-MODEL=$(echo "$DATA" | jq -r '.model.display_name')
+MODEL=$(echo "$DATA" | jq -r '.model.display_name' | sed 's/ ([^)]*)//')
 DUR=$(echo "$DATA" | jq -r '((.cost.total_duration_ms // 0) / 60000 | floor)')
 CTX=$(echo "$DATA" | jq -r '(.context_window.used_percentage // 0)')
+
+# ── Persist rate_limits from Claude response JSON (updated every reply) ──
+INLINE_CACHE="/tmp/.claude-statusline-usage-inline-${PPID}"
+RL_5H=$(echo "$DATA" | jq -r '.rate_limits.five_hour.used_percentage // empty' 2>/dev/null)
+RL_7D=$(echo "$DATA" | jq -r '.rate_limits.seven_day.used_percentage // empty' 2>/dev/null)
+RL_5H_RESET=$(echo "$DATA" | jq -r '.rate_limits.five_hour.resets_at // empty' 2>/dev/null)
+if [[ -n "$RL_5H" || -n "$RL_7D" ]]; then
+  # New data arrived — persist it with a timestamp
+  printf '%s\n' "${RL_5H:-}" "${RL_7D:-}" "${RL_5H_RESET:-}" > "$INLINE_CACHE"
+fi
 
 # ── Account name (cached per session using PPID, TTL 5s) ──
 CACHE_FILE="/tmp/.claude-statusline-account-${PPID}"
@@ -73,7 +83,7 @@ MINT_FG="${E}[38;2;176;213;196m"
 MINT_TXT="${E}[38;2;38;70;55m"
 
 # ══════════════════════════════════════════════════════════════
-# ── CUBE 1: OAuth API usage (five_hour + seven_day) ──
+# ── CUBE 1: usage — inline JSON first, OAuth API as fallback ──
 # ══════════════════════════════════════════════════════════════
 USAGE_CACHE="/tmp/.claude-statusline-usage-global"
 USAGE_BACKOFF="/tmp/.claude-statusline-usage-backoff"
@@ -83,58 +93,80 @@ BACKOFF_TTL=300     # 5 min — after a failed fetch, don't retry
 USAGE_AGE=99999
 USAGE_VALID=0
 USAGE_STALE=0
-if [[ -f "$USAGE_CACHE" ]]; then
-  USAGE_AGE=$(( NOW - $(stat -f %m "$USAGE_CACHE" 2>/dev/null || echo 0) ))
-  if [[ "$USAGE_AGE" -lt "$FRESH_TTL" ]]; then
-    USAGE_VALID=1
+USED_5H=-1
+USED_7D=-1
+RESET_TIME=""
+INLINE_SOURCE=0
+
+# ── Priority 1: inline rate_limits from current Claude response ──
+if [[ -f "$INLINE_CACHE" ]]; then
+  INLINE_AGE=$(( NOW - $(stat -f %m "$INLINE_CACHE" 2>/dev/null || echo 0) ))
+  # Read the three lines: 5h%, 7d%, resets_at (epoch seconds)
+  { read IL_5H; read IL_7D; read IL_RESET; } < "$INLINE_CACHE"
+  if [[ -n "$IL_5H" || -n "$IL_7D" ]]; then
+    USED_5H=$(printf '%.0f' "${IL_5H:--1}" 2>/dev/null || echo -1)
+    USED_7D=$(printf '%.0f' "${IL_7D:--1}" 2>/dev/null || echo -1)
+    # Convert epoch to HH:MM
+    if [[ -n "$IL_RESET" && "$IL_RESET" =~ ^[0-9]+$ ]]; then
+      RESET_TIME=$(date -r "$IL_RESET" +%H:%M 2>/dev/null || echo "")
+    fi
+    USAGE_AGE="$INLINE_AGE"
     USAGE_STALE=0
-  elif [[ "$USAGE_AGE" -lt "$STALE_TTL" ]]; then
-    USAGE_VALID=1
-    USAGE_STALE=1
-  fi
-fi
-# If cache expired, check backoff before re-fetching
-if [[ "$USAGE_VALID" -eq 0 && -f "$USAGE_BACKOFF" ]]; then
-  BACKOFF_AGE=$(( NOW - $(stat -f %m "$USAGE_BACKOFF" 2>/dev/null || echo 0) ))
-  if [[ "$BACKOFF_AGE" -lt "$BACKOFF_TTL" && -f "$USAGE_CACHE" ]]; then
-    # Still in backoff window — use stale cache, don't hit API
-    USAGE_VALID=1
-    USAGE_STALE=1
-  fi
-fi
-if [[ "$USAGE_VALID" -eq 1 ]]; then
-  USAGE_JSON=$(<"$USAGE_CACHE")
-else
-  ACCESS_TOKEN=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null)
-  FRESH_JSON=""
-  if [[ -n "$ACCESS_TOKEN" ]]; then
-    FRESH_JSON=$(curl -s --max-time 5 \
-      -H "Authorization: Bearer ${ACCESS_TOKEN}" \
-      -H "anthropic-beta: oauth-2025-04-20" \
-      -H "User-Agent: claude-code/2.1.72" \
-      "https://api.anthropic.com/api/oauth/usage" 2>/dev/null || echo '')
-  fi
-  if echo "$FRESH_JSON" | grep -q 'five_hour' 2>/dev/null; then
-    # Success — update cache, clear backoff
-    USAGE_JSON="$FRESH_JSON"
-    USAGE_AGE=0
-    USAGE_STALE=0
-    echo "$USAGE_JSON" > "$USAGE_CACHE"
-    rm -f "$USAGE_BACKOFF"
-  elif [[ -f "$USAGE_CACHE" ]]; then
-    # Fetch failed — use stale cache, set backoff to prevent retry storm
-    USAGE_JSON=$(<"$USAGE_CACHE")
-    USAGE_STALE=1
-    touch "$USAGE_BACKOFF"
-  else
-    USAGE_JSON='{}'
-    USAGE_STALE=1
-    touch "$USAGE_BACKOFF"
+    INLINE_SOURCE=1
   fi
 fi
 
-# Parse five_hour and seven_day from API response
-read USED_5H USED_7D RESET_TIME <<< $(echo "$USAGE_JSON" | python3 -c "
+# ── Priority 2: OAuth API (existing mechanism — used when no inline data) ──
+if [[ "$INLINE_SOURCE" -eq 0 ]]; then
+  if [[ -f "$USAGE_CACHE" ]]; then
+    USAGE_AGE=$(( NOW - $(stat -f %m "$USAGE_CACHE" 2>/dev/null || echo 0) ))
+    if [[ "$USAGE_AGE" -lt "$FRESH_TTL" ]]; then
+      USAGE_VALID=1
+      USAGE_STALE=0
+    elif [[ "$USAGE_AGE" -lt "$STALE_TTL" ]]; then
+      USAGE_VALID=1
+      USAGE_STALE=1
+    fi
+  fi
+  # If cache expired, check backoff before re-fetching
+  if [[ "$USAGE_VALID" -eq 0 && -f "$USAGE_BACKOFF" ]]; then
+    BACKOFF_AGE=$(( NOW - $(stat -f %m "$USAGE_BACKOFF" 2>/dev/null || echo 0) ))
+    if [[ "$BACKOFF_AGE" -lt "$BACKOFF_TTL" && -f "$USAGE_CACHE" ]]; then
+      USAGE_VALID=1
+      USAGE_STALE=1
+    fi
+  fi
+  if [[ "$USAGE_VALID" -eq 1 ]]; then
+    USAGE_JSON=$(<"$USAGE_CACHE")
+  else
+    ACCESS_TOKEN=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null)
+    FRESH_JSON=""
+    if [[ -n "$ACCESS_TOKEN" ]]; then
+      FRESH_JSON=$(curl -s --max-time 5 \
+        -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+        -H "anthropic-beta: oauth-2025-04-20" \
+        -H "User-Agent: claude-code/2.1.72" \
+        "https://api.anthropic.com/api/oauth/usage" 2>/dev/null || echo '')
+    fi
+    if echo "$FRESH_JSON" | grep -q 'five_hour' 2>/dev/null; then
+      USAGE_JSON="$FRESH_JSON"
+      USAGE_AGE=0
+      USAGE_STALE=0
+      echo "$USAGE_JSON" > "$USAGE_CACHE"
+      rm -f "$USAGE_BACKOFF"
+    elif [[ -f "$USAGE_CACHE" ]]; then
+      USAGE_JSON=$(<"$USAGE_CACHE")
+      USAGE_STALE=1
+      touch "$USAGE_BACKOFF"
+    else
+      USAGE_JSON='{}'
+      USAGE_STALE=1
+      touch "$USAGE_BACKOFF"
+    fi
+  fi
+
+  # Parse five_hour and seven_day from OAuth API response
+  read USED_5H USED_7D RESET_TIME <<< $(echo "$USAGE_JSON" | python3 -c "
 import sys, json, datetime
 d = json.load(sys.stdin)
 fh = d.get('five_hour') or {}
@@ -152,10 +184,10 @@ if reset:
     except: pass
 print(f'{p5} {p7} {rt or \"_\"}')
 " 2>/dev/null || echo "-1 -1 _")
+  [[ "$RESET_TIME" == "_" ]] && RESET_TIME=""
+fi
 
-[[ "$RESET_TIME" == "_" ]] && RESET_TIME=""
-
-# Age label for API data
+# Age label for data source
 if [[ "$USAGE_AGE" -lt 60 ]]; then
   AGE_LABEL="${USAGE_AGE}s"
 elif [[ "$USAGE_AGE" -lt 3600 ]]; then
@@ -221,7 +253,7 @@ ROW1+="${R}${PCH3_FG}${PL}${R}"
 
 # ── ROW2: 5h → reset → 7d ──
 # Cube 1: API 5h
-ROW2="${SL1_BG}${SL1_TXT} 󰧒 5h ${SL1_HI}${LABEL_5H}${SL1_TXT}  ${AGE_LABEL} "
+ROW2="${SL1_BG}${SL1_TXT} 󱎫 5h ${SL1_HI}${LABEL_5H}${SL1_TXT}  ${AGE_LABEL} "
 
 # Reset segment
 if [[ -n "$RESET_TIME" ]]; then
